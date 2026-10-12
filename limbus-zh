@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Native Steam/Proton installer for the LLC Chinese language pack."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
+
+REPO = 'LocalizeLimbusCompany/LocalizeLimbusCompany'
+API = 'https://api.github.com/repos/' + REPO
+REL = Path('LimbusCompany_Data/Lang/LLC_zh-CN')
+STATE = '.limbus-zh.json'
+APPID = '1973530'
+
+
+def request(url):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={
+        'User-Agent': 'limbus-zh/0.1', 'Accept': 'application/vnd.github+json'}), timeout=60)
+
+
+def metadata(url):
+    with request(url) as response:
+        return json.load(response)
+
+
+def download(url, dest, expected, git_blob=False):
+    for attempt in range(3):
+        try:
+            print('下载：' + dest.name, flush=True)
+            with request(url) as response, dest.open('wb') as out:
+                shutil.copyfileobj(response, out)
+            if git_blob:
+                digest = hashlib.sha1()
+                digest.update(('blob %d\0' % dest.stat().st_size).encode())
+            else:
+                digest = hashlib.sha256()
+            with dest.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected:
+                raise ValueError('下载校验失败：' + dest.name)
+            return
+        except (OSError, ValueError) as error:
+            if attempt == 2:
+                raise error
+            time.sleep(attempt + 1)
+
+
+def vdf(text):
+    tokens = re.findall(r'"((?:\\.|[^"\\])*)"|([{}])', re.sub(r'//[^\n]*', '', text))
+    stream = iter([re.sub(r'\\([\\"])', r'\1', a) if not b else b for a, b in tokens])
+    def obj():
+        result = {}
+        for key in stream:
+            if key == '}':
+                return result
+            value = next(stream)
+            result[key] = obj() if value == '{' else value
+        return result
+    return obj()
+
+
+def discover(home=None):
+    home = Path(home or Path.home())
+    roots = [home / '.local/share/Steam', home / '.steam/steam', home / '.steam/root',
+             home / '.var/app/com.valvesoftware.Steam/.local/share/Steam']
+    if os.environ.get('XDG_DATA_HOME'):
+        roots.append(Path(os.environ['XDG_DATA_HOME']) / 'Steam')
+    libraries = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        libraries.add(root.resolve())
+        config = root / 'steamapps/libraryfolders.vdf'
+        if config.is_file():
+            for key, value in vdf(config.read_text()).get('libraryfolders', {}).items():
+                path = value.get('path') if isinstance(value, dict) else value if key.isdigit() else None
+                if path:
+                    libraries.add(Path(path).expanduser().resolve())
+    found = set()
+    for library in libraries:
+        manifest = library / ('steamapps/appmanifest_' + APPID + '.acf')
+        if manifest.is_file():
+            name = vdf(manifest.read_text()).get('AppState', {}).get('installdir')
+            if name:
+                game = library / 'steamapps/common' / name
+                if (game / 'LimbusCompany.exe').is_file():
+                    found.add(game.resolve())
+    return sorted(found)
+
+
+def game_path(value):
+    if value:
+        game = Path(value).expanduser().resolve()
+    else:
+        found = discover()
+        if len(found) != 1:
+            raise ValueError('未找到唯一游戏目录，请使用 --game-dir 指定。发现：' + str(found))
+        game = found[0]
+    if not (game / 'LimbusCompany.exe').is_file() or not (game / 'LimbusCompany_Data').is_dir():
+        raise ValueError('目录必须包含 LimbusCompany.exe 和 LimbusCompany_Data')
+    return game
+
+
+def safe_path(name):
+    path = PurePosixPath(name)
+    if '\\' in name or path.is_absolute() or '..' in path.parts or ':' in name:
+        raise ValueError('压缩包包含不安全路径：' + name)
+    prefix = PurePosixPath(REL.as_posix())
+    if not path.is_relative_to(prefix):
+        raise ValueError('压缩包包含语言目录之外的文件：' + name)
+    return path.relative_to(prefix)
+
+
+def extract_text(archive, target):
+    with zipfile.ZipFile(archive) as z:
+        if sum(i.file_size for i in z.infolist()) > 512 * 1024 * 1024:
+            raise ValueError('文本包解压大小异常')
+        for item in z.infolist():
+            relative = safe_path(item.filename)
+            if stat.S_ISLNK(item.external_attr >> 16):
+                raise ValueError('不接受符号链接')
+            dest = target / str(relative)
+            if item.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(item) as src, dest.open('wb') as out:
+                    shutil.copyfileobj(src, out)
+    if not (target / 'Info/version.json').is_file():
+        raise ValueError('发布包缺少 Info/version.json')
+
+
+def extract_font(archive, stage):
+    exe = shutil.which('7z') or shutil.which('7zz')
+    if not exe:
+        raise ValueError('缺少 7zip，请运行 sudo pacman -S 7zip')
+    listing = subprocess.check_output([exe, 'l', '-slt', str(archive)], text=True)
+    entries = listing.split('----------', 1)[-1]
+    for block in entries.strip().split('\n\n'):
+        fields = dict(line.split(' = ', 1) for line in block.splitlines() if ' = ' in line)
+        if 'Path' in fields:
+            name = fields['Path']
+            if name not in ('LimbusCompany_Data', 'LimbusCompany_Data/Lang'):
+                relative = safe_path(name)
+                if relative.parts and relative.parts[0] != 'Font':
+                    raise ValueError('字体包包含 Font 之外的文件')
+        if any(k in fields for k in ('Symbolic Link', 'Hard Link')) or ' l' in fields.get('Attributes', ''):
+            raise ValueError('字体包含链接')
+    subprocess.run([exe, 'x', '-y', '-o' + str(stage), str(archive)], check=True, stdout=subprocess.DEVNULL)
+    for path in stage.rglob('*'):
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise ValueError('字体包含特殊文件')
+    font_root = stage / REL
+    if not font_root.is_dir():
+        raise ValueError('字体包结构与预期不符')
+    return font_root
+
+
+def read_state(target):
+    path = target / STATE
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def guard(parent):
+    for path in [parent, *parent.parents]:
+        if path.is_symlink():
+            raise ValueError('语言目录父路径包含符号链接')
+
+
+@contextlib.contextmanager
+def locked(parent):
+    guard(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    lock = parent / '.limbus-zh.lock'
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('另一个 limbus-zh 正在操作此目录')
+        yield
+
+
+def deploy(target, prepared, backup):
+    if target.is_symlink() or backup.is_symlink():
+        raise ValueError('拒绝替换符号链接目录')
+    if backup.exists():
+        raise ValueError('已有备份，请先回滚或手动保存/移走 ' + str(backup))
+    had_old = target.exists()
+    if had_old:
+        target.rename(backup)
+    try:
+        prepared.rename(target)
+    except BaseException:
+        if had_old:
+            backup.rename(target)
+        raise
+
+
+def running():
+    for proc in Path('/proc').glob('[0-9]*/comm'):
+        try:
+            if proc.read_text().strip().lower().startswith('limbuscompany'):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='边狱公司零协会汉化安装更新工具（Steam/Proton）')
+    parser.add_argument('command', choices=['find', 'status', 'check', 'install', 'update', 'rollback'])
+    parser.add_argument('--game-dir', help='游戏根目录（含 LimbusCompany.exe）')
+    parser.add_argument('--discard-backup', action='store_true', help='删除上次备份，腾出空间保存本次更新前的版本')
+    parser.add_argument('--force', action='store_true', help='同版本也重新安装')
+    args = parser.parse_args(argv)
+    if args.command == 'find':
+        paths = discover()
+        for path in paths:
+            print(path)
+        if not paths:
+            print('未发现游戏，请通过 Steam 浏览本地文件并使用 --game-dir。')
+        return
+    game = game_path(args.game_dir)
+    target = game / REL
+    backup = target.with_name('LLC_zh-CN.limbus-zh-backup')
+    print('游戏目录：' + str(game))
+    if args.command == 'status':
+        print('工具记录：' + json.dumps(read_state(target), ensure_ascii=False))
+        version = target / 'Info/version.json'
+        if version.is_file():
+            print('语言包版本：' + version.read_text())
+        print('备份：' + ('有' if backup.exists() else '无'))
+        return
+    if args.command == 'check':
+        release = metadata(API + '/releases/latest')
+        installed = read_state(target).get('version')
+        print('本地版本：' + str(installed or '未记录（可能为手动安装）'))
+        print('最新版本：' + release['tag_name'])
+        print('已是最新。' if installed == release['tag_name'] else '可运行 update 安装最新版。')
+        return
+    if running():
+        raise ValueError('请先退出边狱公司再安装或回滚')
+    with locked(target.parent):
+        if target.is_symlink() or backup.is_symlink():
+            raise ValueError('语言或备份目录不能是符号链接')
+        if args.command == 'rollback':
+            if not backup.is_dir():
+                raise ValueError('没有可恢复的备份')
+            displaced = target.with_name('.limbus-zh-swap')
+            if displaced.exists():
+                raise ValueError('发现未完成的目录交换，请检查 ' + str(displaced))
+            had_current = target.exists()
+            if had_current:
+                target.rename(displaced)
+            try:
+                backup.rename(target)
+            except BaseException:
+                if had_current:
+                    displaced.rename(target)
+                raise
+            if had_current:
+                displaced.rename(backup)
+            print('已恢复备份；替换前的版本保留在备份目录。')
+            return
+        release = metadata(API + '/releases/latest')
+        current = read_state(target)
+        if current.get('version') == release['tag_name'] and not args.force:
+            print('已是最新；修复安装可加 --force。')
+            return
+        if backup.exists() and not args.discard_backup:
+            raise ValueError('保留着上次备份，请先保存/移走它再更新：' + str(backup))
+        assets = [a for a in release['assets'] if re.fullmatch(r'LimbusLocalize_.*\.zip', a['name'])]
+        if len(assets) != 1:
+            raise ValueError('未找到唯一的 ZIP 语言包；上游发布格式可能已改变')
+        asset = assets[0]
+        digest = asset.get('digest') or ''
+        if not digest.startswith('sha256:'):
+            raise ValueError('上游未提供 SHA-256，拒绝未经校验的安装')
+        font = metadata(API + '/contents/Fonts/LLCCN-Font.7z?ref=main')
+        with tempfile.TemporaryDirectory(prefix='.limbus-zh-', dir=target.parent) as temp:
+            temp = Path(temp)
+            prepared = temp / 'prepared'
+            prepared.mkdir()
+            text_file = temp / 'text.zip'
+            download(asset['browser_download_url'], text_file, digest.split(':', 1)[1])
+            extract_text(text_file, prepared)
+            # Fetch the font every time so a manually deleted font is repaired too.
+            font_file = temp / 'font.7z'
+            download(font['download_url'], font_file, font['sha'], git_blob=True)
+            font_stage = temp / 'font-stage'
+            font_stage.mkdir()
+            shutil.copytree(extract_font(font_file, font_stage), prepared, dirs_exist_ok=True)
+            state = {'version': release['tag_name'], 'font_blob': font['sha'], 'text_sha256': digest,
+                     'source': 'https://github.com/' + REPO, 'installed_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+            (prepared / STATE).write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+            if backup.exists() and args.discard_backup:
+                shutil.rmtree(backup)
+            deploy(target, prepared, backup)
+        print('安装完成。进入游戏选择 LLC_zh-CN；基础语言建议选英文。')
+        if backup.exists():
+            print('旧语言目录已备份：' + str(backup))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
+        print('错误：' + str(error), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print('已取消。', file=sys.stderr)
+        sys.exit(130)
